@@ -1,0 +1,110 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset
+from PIL import Image
+import os
+import numpy as np
+import cv2
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
+class ColorizationDataset(Dataset):
+    def __init__(self, input_dir, gt_dir):
+        self.input_dir = input_dir
+        self.gt_dir = gt_dir
+        self.image_filenames = [f for f in os.listdir(input_dir) if os.path.exists(os.path.join(gt_dir, f))]
+        print(f"Dataset initialized with {len(self.image_filenames)} images.")
+
+    def __len__(self):
+        return len(self.image_filenames)
+
+    def __getitem__(self, idx):
+        filename = self.image_filenames[idx]
+        input_path = os.path.join(self.input_dir, filename)
+        gt_path = os.path.join(self.gt_dir, filename)
+
+        color_img = Image.open(gt_path).convert("RGB").resize((256, 256))
+        img_np = np.array(color_img, dtype=np.float32) / 255.0
+        img_lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+
+        L = img_lab[:, :, 0:1] / 100.0
+        ab = img_lab[:, :, 1:3] / 128.0
+
+        if idx % 100 == 0:
+            print(f"Processed {idx} images in dataset.")
+
+        return torch.tensor(L, dtype=torch.float32).permute(2, 0, 1), \
+            torch.tensor(ab, dtype=torch.float32).permute(2, 0, 1)
+
+
+train_dataset = ColorizationDataset("../picture/train_input/", "../picture/train_gt/")
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+print("DataLoader initialized.")
+
+
+class VGG19FeatureExtractor(nn.Module):
+    def __init__(self):
+        super(VGG19FeatureExtractor, self).__init__()
+        vgg19 = models.vgg19(pretrained=True).features
+        self.features = nn.Sequential(*list(vgg19.children())[:18])
+        for param in self.features.parameters():
+            param.requires_grad = False
+        print("VGG19 Feature Extractor initialized.")
+
+
+class ColorizationModel(nn.Module):
+    def __init__(self):
+        super(ColorizationModel, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.ReLU()
+        )
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 2, kernel_size=3, stride=1, padding=1),
+            nn.Tanh()
+        )
+        print("Colorization Model initialized.")
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x
+
+
+model = ColorizationModel().to(device)
+criterion = nn.L1Loss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+print("Model, loss function, and optimizer initialized.")
+
+num_epochs = 10
+for epoch in range(num_epochs):
+    model.train()
+    total_loss = 0
+    print(f"Starting epoch {epoch + 1}/{num_epochs}...")
+
+    for batch_idx, (L, ab) in enumerate(train_loader):
+        L, ab = L.to(device), ab.to(device)
+        optimizer.zero_grad()
+        ab_pred = model(L)
+        loss = criterion(ab_pred, ab)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+
+        if batch_idx % 10 == 0:
+            print(f"Epoch {epoch + 1}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+
+    print(f"Epoch [{epoch + 1}/{num_epochs}], Average Loss: {total_loss / len(train_loader):.4f}")
